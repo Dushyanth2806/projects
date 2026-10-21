@@ -1,4 +1,4 @@
-import json
+﻿
 import logging
 import os
 
@@ -10,8 +10,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage, ToolMessage
-from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from tools import tools
@@ -20,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 system_prompt = """
-You are a helpful restaurant assistant.
+You are a helpful restaurant recommendation assistant.
 
 You have access to these tools:
 
@@ -32,24 +30,22 @@ Use the appropriate tool whenever necessary.
 
 Do not invent restaurant information.
 
-For reservations, never guess the date or party size. If either is
-missing, ask the user for it before calling the availability tool.
-Dates in the system use the format YYYY-MM-DD.
-
-If the available tools cannot answer the question, clearly say that
-the requested information is outside your available capabilities.
+If the available tools cannot answer the question,
+clearly say that the requested information is outside
+your available capabilities.
 
 Be friendly, conversational, and concise.
 """
 
-# Fail fast when Gemini is overloaded instead of retrying for many seconds.
 model = init_chat_model(
-    os.getenv("MODEL", "google_genai:gemini-3.5-flash-lite"),
-    max_retries=1,
-    timeout=30,
+    os.getenv("MODEL", "openai:gpt-4o-mini")
 )
 
-agent = create_agent(model=model, tools=tools, system_prompt=system_prompt)
+agent = create_agent(
+    model=model,
+    tools=tools,
+    system_prompt=system_prompt,
+)
 
 app = FastAPI(title="Restaurant Assistant API")
 
@@ -72,58 +68,59 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    source: str = "Google Gemini"
     reply: str
-    tool_calls: list[dict]  # [{name, args, output}]
+    tool_calls: list[dict]
 
 
 def _text(content) -> str:
     if isinstance(content, str):
         return content
+
     if isinstance(content, list):
         return "".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict)
         )
+
     return str(content) if content is not None else ""
 
 
-def _tool_calls(messages: list) -> list[dict]:
-    """Pair each tool call the agent made with its output."""
-    outputs = {m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)}
-    calls = []
-    for m in messages:
-        if not isinstance(m, AIMessage):
-            continue
-        for c in m.tool_calls:
-            out = outputs.get(c["id"])
-            raw = out.content if out else ""
-            calls.append(
-                {
-                    "name": c["name"],
-                    "args": c["args"],
-                    "output": raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False),
-                }
-            )
-    return calls
-
-
-@traceable(name="Gemini Restaurant Agent", run_type="chain")
-async def run_turn(req: ChatRequest) -> ChatResponse:
-    messages = [m.model_dump() for m in req.history]
-    messages.append({"role": "user", "content": req.message})
-    result = await agent.ainvoke({"messages": messages})
-
-    new = result["messages"][len(messages):]  # only this turn's messages
-    return ChatResponse(reply=_text(new[-1].content), tool_calls=_tool_calls(new))
+async def invoke_agent(messages: list[dict]):
+    return await agent.ainvoke({"messages": messages})
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    messages = [m.model_dump() for m in req.history]
+    messages.append({"role": "user", "content": req.message})
+
     try:
-        return await run_turn(req)
+        result = await invoke_agent(messages)
     except Exception:
-        logger.exception("Gemini agent failed")
-        raise HTTPException(status_code=502, detail="The Gemini agent failed to respond.")
+        logger.exception("OpenAI agent invocation failed")
+        raise HTTPException(
+            status_code=502,
+            detail="The restaurant assistant could not process your request.",
+        )
+
+    out = result["messages"]
+
+    tool_calls = [
+        {
+            "name": m.name,
+            "output": _text(m.content),
+        }
+        for m in out
+        if getattr(m, "type", None) == "tool"
+    ]
+
+    reply = _text(out[-1].content) if out else ""
+
+    return ChatResponse(
+        reply=reply,
+        tool_calls=tool_calls,
+    )
 
 
 @app.get("/health")

@@ -25,45 +25,46 @@ const jsonText = <T extends z.ZodTypeAny>(schema: T) =>
     try { return JSON.parse(v); } catch { return v; }
   }, schema);
 
-// ---- Tool calls: discriminated union on `name`; the backend sends name + args + output ----
+// ---- Tool calls: discriminated union on `name` (the backend sends name + output only) ----
 export const ToolCall = z.discriminatedUnion("name", [
   z.object({
     name: z.literal("search_restaurants_by_cuisine"),
-    args: z.object({ cuisine_type: z.string() }),
     output: jsonText(z.array(RestaurantSummary)),
   }),
   z.object({
     name: z.literal("get_restaurant_details"),
-    args: z.object({ restaurant_name: z.string() }),
     output: jsonText(z.union([RestaurantDetails, ToolError])),
   }),
   z.object({
     name: z.literal("check_reservation_availability"),
-    args: z.object({
-      restaurant_name: z.string(),
-      date: z.string(),
-      party_size: z.number(),
-    }),
     output: z.string(),
   }),
 ]);
 export type ToolCall = z.infer<typeof ToolCall>;
 
-// ---- Full /chat response (main.py ChatResponse): the Gemini agent's reply and the tool calls it made ----
+// ---- Full /chat response (main.py ChatResponse) ----
 export const ChatResponse = z.object({
-  source: z.string().default("Google Gemini"),
   reply: z.string(),
   tool_calls: z.array(z.unknown()),
 });
-export type ChatResponse = z.infer<typeof ChatResponse>;
 
 export type ToolResult =
   | { ok: true; call: ToolCall }
   | { ok: false; name: string; raw: unknown; issues: string };
 
-/** Validate each tool call; one that does not match its schema is still shown, as raw JSON. */
-export function parseTools(calls: unknown[]): ToolResult[] {
-  return calls.map((raw): ToolResult => {
+export type AgentResult = {
+  reply: string;
+  tools: ToolResult[];
+};
+
+export function parseAgentResponse(input: unknown): AgentResult {
+  // Backend returned plain text / a non-conforming shape: still show it.
+  const base = ChatResponse.safeParse(input);
+  if (!base.success) {
+    const text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+    return { reply: text, tools: [] };
+  }
+  const tools = base.data.tool_calls.map((raw): ToolResult => {
     const parsed = ToolCall.safeParse(raw);
     if (parsed.success) return { ok: true, call: parsed.data };
     const name = (raw as { name?: unknown } | null)?.name;
@@ -74,4 +75,5 @@ export function parseTools(calls: unknown[]): ToolResult[] {
       issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; "),
     };
   });
+  return { reply: base.data.reply, tools };
 }

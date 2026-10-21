@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
 langchain>=1.0
-langchain-core>=1.0
-langchain-google-genai
+langchain-openai
 pydantic
-langsmith
 python-dotenv
