@@ -1,24 +1,41 @@
 # Restaurant Assistant Backend
 
-FastAPI backend: an OpenAI agent (LangChain) with restaurant tools.
+FastAPI backend: an OpenAI agent (LangChain) with restaurant tools. There is no separate frontend; use the Swagger UI at `/docs` to chat with the assistant.
 
-Endpoints: `POST /chat` and `GET /health`. Run: `uvicorn main:app --reload`.
+## Endpoints
 
-Environment variables (set in `.env` locally or in the host's settings; never commit them): `OPENAI_API_KEY`, `CORS_ORIGINS`.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Redirects to `/docs` |
+| POST | `/chat` | Send a message; returns `reply`, `tool_calls` and `session_id` |
+| DELETE | `/chat/{session_id}` | Clear a conversation |
+| GET | `/health` | Health check |
+
+Run: `uvicorn main:app --reload --port 8000`, then open http://127.0.0.1:8000/docs.
+
+## Environment variables
+
+Set in `.env` locally (copy `.env.example`); never commit `.env`.
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | Your OpenAI API key (required) |
+| `MODEL` | Chat model, e.g. `openai:gpt-4o-mini` (optional, this is the default) |
 
 ## main.py
 
 ```python
-﻿
+
 import logging
 import os
+import uuid
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
@@ -58,29 +75,39 @@ agent = create_agent(
     system_prompt=system_prompt,
 )
 
-app = FastAPI(title="Restaurant Assistant API")
+MAX_SESSIONS = 200
+MAX_HISTORY_MESSAGES = 30
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# session_id -> list of {"role", "content"} messages (in memory, lost on restart)
+SESSIONS: dict[str, list[dict]] = {}
 
+API_DESCRIPTION = """
+Chat with a restaurant recommendation assistant, right from this page.
 
-class Message(BaseModel):
-    role: str
-    content: str
+1. Open **POST /chat** -> **Try it out** -> type a message -> **Execute**.
+2. Copy the `session_id` from the response.
+3. Paste it into `session_id` on your next request to continue the conversation.
+4. Call **DELETE /chat/{session_id}** to start over.
+"""
+
+app = FastAPI(title="Restaurant Assistant API", description=API_DESCRIPTION)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[Message] = Field(default_factory=list)
+    message: str = Field(examples=["Show me Italian restaurants"])
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Leave empty to start a new conversation. To continue one, paste "
+            "the session_id returned by a previous response."
+        ),
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
     tool_calls: list[dict]
+    session_id: str
 
 
 def _text(content) -> str:
@@ -101,9 +128,15 @@ async def invoke_agent(messages: list[dict]):
     return await agent.ainvoke({"messages": messages})
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/docs")
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    messages = [m.model_dump() for m in req.history]
+    session_id = req.session_id or uuid.uuid4().hex
+    messages = list(SESSIONS.get(session_id, []))
     messages.append({"role": "user", "content": req.message})
 
     try:
@@ -128,10 +161,23 @@ async def chat(req: ChatRequest):
 
     reply = _text(out[-1].content) if out else ""
 
+    messages.append({"role": "assistant", "content": reply})
+    SESSIONS.pop(session_id, None)
+    SESSIONS[session_id] = messages[-MAX_HISTORY_MESSAGES:]
+    while len(SESSIONS) > MAX_SESSIONS:
+        del SESSIONS[next(iter(SESSIONS))]
+
     return ChatResponse(
         reply=reply,
         tool_calls=tool_calls,
+        session_id=session_id,
     )
+
+
+@app.delete("/chat/{session_id}")
+async def clear_chat(session_id: str):
+    SESSIONS.pop(session_id, None)
+    return {"status": "cleared", "session_id": session_id}
 
 
 @app.get("/health")
@@ -352,13 +398,9 @@ pydantic
 python-dotenv
 ```
 
-## .gitignore
+## .env.example
 
 ```text
-.env
-__pycache__/
-*.pyc
-.venv/
-graphify-out/
+OPENAI_API_KEY=your-openai-api-key
+MODEL=openai:gpt-4o-mini
 ```
-
