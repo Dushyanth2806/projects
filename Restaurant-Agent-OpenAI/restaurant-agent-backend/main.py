@@ -1,13 +1,14 @@
 ﻿
 import logging
 import os
+import uuid
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
@@ -41,29 +42,40 @@ MAX_TOOL_ROUNDS = 5
 
 client = AsyncOpenAI()  # reads OPENAI_API_KEY from the environment
 
-app = FastAPI(title="Restaurant Assistant API")
+# Conversation memory, kept on the server so a client such as Swagger UI only
+# has to send a session_id instead of re-sending the whole history each time.
+# In-memory: it is cleared on restart, and the oldest sessions are dropped.
+SESSIONS: dict[str, list[dict]] = {}
+MAX_SESSIONS = 200
+MAX_HISTORY_MESSAGES = 30
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Restaurant Assistant API",
+    description=(
+        "Chat with the restaurant assistant straight from this page.\n\n"
+        "1. Open **POST /chat**, click **Try it out**, type a `message`, "
+        "click **Execute**.\n"
+        "2. Copy the `session_id` from the response.\n"
+        "3. Paste it into `session_id` on your next request to continue the "
+        "same conversation.\n"
+        "4. Use **DELETE /chat/{session_id}** to start over."
+    ),
 )
 
 
-class Message(BaseModel):
-    role: str
-    content: str
-
-
 class ChatRequest(BaseModel):
-    message: str
-    history: list[Message] = Field(default_factory=list)
+    message: str = Field(examples=["Show me Italian restaurants"])
+    session_id: str | None = Field(
+        default=None,
+        description="Leave empty to start a new chat; reuse the value from "
+        "the previous response to continue it.",
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
     tool_calls: list[dict]
+    session_id: str
 
 
 async def invoke_agent(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -95,8 +107,11 @@ async def invoke_agent(messages: list[dict]) -> tuple[str, list[dict]]:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    messages = [m.model_dump() for m in req.history]
-    messages.append({"role": "user", "content": req.message})
+    session_id = req.session_id or uuid.uuid4().hex
+
+    # Known session: continue it. New or unknown id: start a fresh conversation.
+    past = SESSIONS.get(session_id, [])
+    messages = [*past, {"role": "user", "content": req.message}]
 
     try:
         reply, tool_calls = await invoke_agent(messages)
@@ -107,7 +122,26 @@ async def chat(req: ChatRequest):
             detail="The restaurant assistant could not process your request.",
         )
 
-    return ChatResponse(reply=reply, tool_calls=tool_calls)
+    # Save the exchange so the next request with this session_id remembers it.
+    messages.append({"role": "assistant", "content": reply})
+    SESSIONS.pop(session_id, None)  # re-insert so recent sessions stay newest
+    SESSIONS[session_id] = messages[-MAX_HISTORY_MESSAGES:]
+    while len(SESSIONS) > MAX_SESSIONS:
+        SESSIONS.pop(next(iter(SESSIONS)))
+
+    return ChatResponse(reply=reply, tool_calls=tool_calls, session_id=session_id)
+
+
+@app.delete("/chat/{session_id}")
+async def reset_chat(session_id: str):
+    """Forget a conversation so the next message starts fresh."""
+    SESSIONS.pop(session_id, None)
+    return {"status": "cleared", "session_id": session_id}
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse("/docs")
 
 
 @app.get("/health")
