@@ -1,23 +1,3 @@
-# Restaurant Assistant Backend
-
-FastAPI backend with a single Gemini agent, calling the `google-genai` SDK directly (no LangChain or LangSmith). `POST /chat` takes `{message, history}` and returns `{source, reply, tool_calls}`, where each tool call is `{name, args, output}`.
-
-Tools (`tools.py`): search restaurants by cuisine, get restaurant details, check reservation availability. They are plain Python functions, registered in `TOOL_FUNCTIONS` and described to Gemini by `TOOL_DECLARATIONS`.
-
-Endpoints: `POST /chat` and `GET /health`. Run: `uvicorn main:app --reload`.
-
-Environment variables (set in `.env` locally or in the host's settings; never commit them): `GOOGLE_API_KEY`, `MODEL` (optional, default `gemini-3.8-flash`), `CORS_ORIGINS`.
-
-## How a chat turn works
-
-1. The request history plus the new message become Gemini `Content` objects (`assistant` maps to the `model` role).
-2. Gemini is called with the system prompt and the tool declarations.
-3. If it asks for tools, each one is run, the results are sent back, and the model is called again (at most 5 rounds).
-4. When the model replies with plain text, that text and the list of tool calls are returned.
-
-## main.py
-
-```python
 import json
 import logging
 import os
@@ -28,6 +8,7 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
@@ -70,7 +51,14 @@ config = types.GenerateContentConfig(
     tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
 )
 
-app = FastAPI(title="Restaurant Assistant API")
+app = FastAPI(
+    title="Restaurant Assistant API",
+    description=(
+        "Chat with a Gemini restaurant agent. Open **POST /chat**, click "
+        "*Try it out*, and send a message. To continue a conversation, copy the "
+        "previous turns into `history`."
+    ),
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,19 +69,40 @@ app.add_middleware(
 
 
 class Message(BaseModel):
-    role: str
+    role: str = Field(description="`user` or `assistant`", examples=["user"])
     content: str
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[Message] = Field(default_factory=list)
+    message: str = Field(examples=["Is Spice Palace free on 2024-11-15 for 4 people?"])
+    history: list[Message] = Field(default_factory=list, description="Earlier turns, oldest first")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"message": "Suggest some Italian restaurants", "history": []},
+                {
+                    "message": "Tell me more about the first one",
+                    "history": [
+                        {"role": "user", "content": "Suggest some Italian restaurants"},
+                        {"role": "assistant", "content": "Try Pizza Bella, Pasta Dreams or Roma Kitchen."},
+                    ],
+                },
+            ]
+        }
+    }
+
+
+class ToolCall(BaseModel):
+    name: str
+    args: dict
+    output: str = Field(description="Tool result; lists and dicts are JSON text")
 
 
 class ChatResponse(BaseModel):
     source: str = "Google Gemini"
     reply: str
-    tool_calls: list[dict]  # [{name, args, output}]
+    tool_calls: list[ToolCall]
 
 
 def _run_tool(name: str, args: dict):
@@ -149,7 +158,12 @@ async def run_turn(req: ChatRequest) -> ChatResponse:
     )
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse("/docs")
+
+
+@app.post("/chat", response_model=ChatResponse, tags=["agent"], summary="Send a message to the agent")
 async def chat(req: ChatRequest):
     try:
         return await run_turn(req)
@@ -158,7 +172,6 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=502, detail="The Gemini agent failed to respond.")
 
 
-@app.get("/health")
+@app.get("/health", tags=["status"])
 async def health():
     return {"status": "ok"}
-```

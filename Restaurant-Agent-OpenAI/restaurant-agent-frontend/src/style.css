@@ -43,10 +43,3 @@ form button:disabled { opacity: .5; }
 .dot.ok { background: var(--ok); }
 .dot.bad { background: var(--bad); }
 .dot.demo { background: #d9a400; }
-.source { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 2px; }
-.answer { align-self: flex-start; width: 100%; max-width: 88%; padding: 10px 14px; border-radius: 14px; background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--muted); display: flex; flex-direction: column; gap: 8px; }
-.answer.gemini { border-left-color: var(--accent); }
-.source-tag { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
-.answer.gemini .source-tag { color: var(--accent); }
-.answer-text { white-space: pre-wrap; }
-.answer .badge { align-self: flex-start; }
